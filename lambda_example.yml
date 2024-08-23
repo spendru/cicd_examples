@@ -1,0 +1,74 @@
+parameters:
+- name: functionName
+  type: string
+  default: 'my-function-1'
+  values:
+  - 'my-function-1'
+  - 'my-function-2'
+  - 'my-function-3'
+
+trigger:
+  - main
+
+variables:
+  - group: aws-credentials
+
+stages:
+- stage: Build
+  jobs:
+  - job: BuildCode
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '14.x'
+    - script: |
+        npm ci
+        npm run build
+      displayName: 'Build code'
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/dist'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/lambda-package.zip'
+    - publish: $(Build.ArtifactStagingDirectory)/lambda-package.zip
+      artifact: drop
+
+- stage: Confirm
+  jobs:
+  - job: ConfirmDeployment
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440 # task times out in 1 day
+      inputs:
+        notifyUsers: |
+          user1@example.com
+          user2@example.com
+        instructions: 'Please confirm deployment to the Lambda function: ${{ parameters.functionName }}'
+        onTimeout: 'reject'
+
+- stage: Deploy
+  jobs:
+  - deployment: DeployLambda
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'Production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          - task: AWSLambdaDeployFunction@1
+            inputs:
+              awsCredentials: 'AWS_Connection'
+              regionName: '$(AWS_REGION)'
+              deploymentMode: 'code'
+              functionName: '${{ parameters.functionName }}'
+              codeLocation: 'localZipFile'
+              localZipFile: '$(Pipeline.Workspace)/drop/lambda-package.zip'
+              handler: 'index.handler'
+              runtime: 'nodejs14.x'
