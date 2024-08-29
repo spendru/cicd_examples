@@ -1,0 +1,117 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: amplify-variables
+
+stages:
+- stage: Build
+  jobs:
+  - job: BuildAndPackage
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '14.x'
+      displayName: 'Install Node.js'
+
+    - script: |
+        npm install -g @aws-amplify/cli
+      displayName: 'Install Amplify CLI'
+
+    - script: |
+        npm ci
+      displayName: 'Install dependencies'
+
+    - task: AWSShellScript@1
+      inputs:
+        awsCredentials: 'AWS-Amplify-Connection'
+        regionName: '$(AWS_REGION)'
+        scriptType: 'inline'
+        inlineScript: |
+          amplify configure --config-level project << EOF
+          $(AWS_ACCESS_KEY_ID)
+          $(AWS_SECRET_ACCESS_KEY)
+          $(AWS_REGION)
+          EOF
+          amplify init --yes
+          amplify push --yes
+      displayName: 'Amplify init and push'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_REGION: $(AWS_REGION)
+
+    - script: |
+        npm run build
+      displayName: 'Build application'
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/build'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip' 
+        replaceExistingArchive: true
+      displayName: 'Archive build files'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'drop'
+      displayName: 'Publish build artifacts'
+
+    - script: |
+        echo "##vso[task.setvariable variable=BUILD_VERSION;isOutput=true]$(Build.BuildId)"
+      name: setBuildVersion
+      displayName: 'Set Build Version'
+
+- stage: Deploy
+  variables:
+    buildVersion: $[ stageDependencies.Build.BuildAndPackage.outputs['setBuildVersion.BUILD_VERSION'] ]
+  jobs:
+  - deployment: DeployToAmplify
+    environment: 'Production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'AWS-Amplify-Connection'
+              regionName: '$(AWS_REGION)'
+              scriptType: 'inline'
+              inlineScript: |
+                echo "Deploying build version: $(buildVersion)"
+                # Start a deployment
+                JOBID=$(aws amplify start-deployment --app-id $(AMPLIFY_APP_ID) --branch-name $(AMPLIFY_BRANCH) --source-url $(System.ArtifactsDirectory)/drop/$(buildVersion).zip --query 'jobId' --output text)
+                
+                echo "Deployment started. Job ID: $JOBID"
+                
+                # Wait for deployment to complete
+                aws amplify wait job-complete --app-id $(AMPLIFY_APP_ID) --branch-name $(AMPLIFY_BRANCH) --job-id $JOBID
+                
+                # Check deployment status
+                STATUS=$(aws amplify get-job --app-id $(AMPLIFY_APP_ID) --branch-name $(AMPLIFY_BRANCH) --job-id $JOBID --query 'job.summary.status' --output text)
+                
+                if [ "$STATUS" = "SUCCEED" ]; then
+                  echo "Deployment succeeded"
+                  exit 0
+                else
+                  echo "Deployment failed"
+                  exit 1
+                fi
+            displayName: 'Deploy to Amplify'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
